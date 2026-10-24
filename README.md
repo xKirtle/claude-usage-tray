@@ -5,6 +5,12 @@ per-model, e.g. Fable) and your Claude Code token usage over the current week.
 It's built for Hyprland with [Quickshell](https://quickshell.org), and themed to match the
 [Caelestia](https://github.com/caelestia-dots/shell) shell.
 
+<p>
+  <img src="docs/screenshots/tray-menu.png" alt="Tray icon (double ring) with its hover menu listing the 5-hour, weekly and Fable limits" width="390">
+  &nbsp;
+  <img src="docs/screenshots/panel.png" alt="Details panel: limit bars with reset countdowns, weekly use by product, and a per-day token chart with an input/output/cache breakdown" width="390">
+</p>
+
 - **Tray icon:** two rings. The outer one is the 5-hour limit and the inner one is the weekly limit.
   They're coloured by severity (normal, warning, critical) and turn grey when the data is stale.
 - **Hover menu:** every limit with its reset time, tokens in the current 5-hour window, the last
