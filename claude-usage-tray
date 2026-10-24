@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""Claude usage tray icon for the Caelestia bar.
+
+- Tray icon (StatusNotifierItem): outer ring = 5-hour limit, inner ring = weekly limit.
+- Hover menu (DBusMenu): every limit with its reset time, plus refresh / details.
+- Left click: toggles the Quickshell details panel (~/.config/quickshell/claude-usage).
+
+Limits come from the endpoint Claude Code's /usage uses, authenticated with the token
+Claude Code already stores. The token is never refreshed here (that would rotate it under
+Claude Code); while it's expired the last good result is shown as stale.
+Token history comes from local Claude Code transcripts (~/.claude/projects/**/*.jsonl).
+Everything the panel needs is written to ~/.cache/claude-usage/state.json.
+"""
+import glob
+import json
+import math
+import os
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+import cairo
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+HOME = os.path.expanduser("~")
+CREDS = f"{HOME}/.claude/.credentials.json"
+PROJECTS = f"{HOME}/.claude/projects"
+SCHEME = f"{HOME}/.local/state/caelestia/scheme.json"
+CACHE_DIR = f"{os.environ.get('XDG_CACHE_HOME', HOME + '/.cache')}/claude-usage"
+STATE = f"{CACHE_DIR}/state.json"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+API_EVERY = 300      # seconds between usage-endpoint polls
+HISTORY_EVERY = 60   # seconds between transcript rescans
+HOVER_REFRESH = 60   # hovering the icon refreshes if the last check is older than this
+
+WATCHER = "org.kde.StatusNotifierWatcher"
+SNI_IFACE = "org.kde.StatusNotifierItem"
+MENU_IFACE = "com.canonical.dbusmenu"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+WARN_COLOUR = "fab387"  # Catppuccin peach; schemes don't carry a reliable "warning" colour
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).isoformat() if dt else None
+
+
+# ---------------------------------------------------------------- data sources
+
+def fetch_usage():
+    """Returns (payload, error). Never refreshes the token."""
+    try:
+        with open(CREDS) as f:
+            creds = json.load(f)["claudeAiOauth"]
+    except (OSError, KeyError, ValueError):
+        return None, "no Claude Code login found"
+    if creds.get("expiresAt", 0) / 1000 < time.time() + 30:
+        return None, "login expired; use Claude Code to renew it"
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + creds["accessToken"],
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-usage-tray/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        return None, {401: "login expired; use Claude Code to renew it",
+                      403: "login expired; use Claude Code to renew it",
+                      429: "rate limited, retrying later"}.get(e.code, f"HTTP {e.code}")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None, "offline"
+
+
+def plan_name():
+    """'Max 5x', 'Pro', ... from the stored login; readable even when the token has expired."""
+    try:
+        with open(CREDS) as f:
+            creds = json.load(f)["claudeAiOauth"]
+    except (OSError, KeyError, ValueError):
+        return None
+    sub = (creds.get("subscriptionType") or "").capitalize()
+    tier = creds.get("rateLimitTier") or ""
+    mult = tier.rsplit("_", 1)[-1] if tier.endswith("x") and tier.rsplit("_", 1)[-1][:-1].isdigit() else ""
+    return " ".join(p for p in (sub, mult) if p) or None
+
+
+_file_cache = {}  # path ->(mtime, size, {msg_key: (ts, input, output, cache_write, cache_read, model)})
+
+
+def _parse_transcript(path):
+    out = {}
+    with open(path, errors="replace") as f:
+        for line in f:
+            if '"usage"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            msg = d.get("message")
+            if d.get("type") != "assistant" or not isinstance(msg, dict):
+                continue
+            u, ts, model = msg.get("usage"), d.get("timestamp"), msg.get("model", "")
+            if not u or not ts or model == "<synthetic>":
+                continue
+            # Streamed messages repeat per content block; the last line has the final counts.
+            key = f"{msg.get('id') or d.get('uuid')}:{d.get('requestId')}"
+            out[key] = (ts, u.get("input_tokens") or 0, u.get("output_tokens") or 0,
+                        u.get("cache_creation_input_tokens") or 0,
+                        u.get("cache_read_input_tokens") or 0, model)
+    return out
+
+
+def scan_history(since):
+    """All assistant-message usage records from transcripts touched since `since`, deduped."""
+    records, seen = {}, set()
+    for path in glob.glob(f"{PROJECTS}/**/*.jsonl", recursive=True):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        seen.add(path)
+        if st.st_mtime < since.timestamp():
+            continue
+        cached = _file_cache.get(path)
+        if not cached or cached[:2] != (st.st_mtime, st.st_size):
+            try:
+                cached = (st.st_mtime, st.st_size, _parse_transcript(path))
+            except OSError:
+                continue
+            _file_cache[path] = cached
+        records.update(cached[2])
+    for gone in set(_file_cache) - seen:
+        del _file_cache[gone]
+    return records.values()
+
+
+def limit_label(lim):
+    kind = lim.get("kind")
+    if kind == "session":
+        return "5-hour"
+    if kind == "weekly_all":
+        return "Weekly"
+    scope = lim.get("scope") or {}
+    for part in ("model", "surface"):
+        name = (scope.get(part) or {}).get("display_name")
+        if name:
+            return name
+    return (kind or "limit").replace("_", " ").capitalize()
+
+
+def severity(lim):
+    sev = lim.get("severity")
+    if sev in ("normal", "warning", "critical"):
+        return sev
+    pct = lim.get("percent") or 0
+    return "critical" if pct >= 90 else "warning" if pct >= 75 else "normal"
+
+
+# ---------------------------------------------------------------- state
+
+class State:
+    def __init__(self):
+        self.usage = None          # last successful payload
+        self.usage_at = None       # when it was fetched
+        self.checked_at = None
+        self.error = None
+        self.history = None
+        self.lock = threading.Lock()
+        try:
+            with open(STATE) as f:
+                old = json.load(f)
+            self.usage, self.usage_at = old.get("raw"), parse_ts(old.get("updated"))
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def stale(self):
+        return self.usage is None or self.error is not None
+
+    def limits(self):
+        if not self.usage:
+            return []
+        return [{
+            "label": limit_label(l),
+            "percent": l.get("percent") or 0,
+            "severity": severity(l),
+            "resets_at": l.get("resets_at"),
+            "active": bool(l.get("is_active")),
+        } for l in self.usage.get("limits") or []]
+
+    def window(self):
+        """Current weekly window [start, end); falls back to the last 7 days."""
+        weekly = next((l for l in (self.usage or {}).get("limits") or []
+                       if l.get("kind") == "weekly_all"), None)
+        end = parse_ts(weekly and weekly.get("resets_at"))
+        if end:
+            while end <= now():  # cached window already reset
+                end += timedelta(days=7)
+            return end - timedelta(days=7), end
+        local_midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        return local_midnight - timedelta(days=6), local_midnight + timedelta(days=1)
+
+    def session_window(self):
+        sess = next((l for l in (self.usage or {}).get("limits") or []
+                     if l.get("kind") == "session"), None)
+        end = parse_ts(sess and sess.get("resets_at"))
+        return (end - timedelta(hours=5), end) if end and end > now() else (None, None)
+
+    def compute_history(self):
+        start, end = self.window()
+        s_start, s_end = self.session_window()
+        days = [{"start": iso(start + timedelta(days=i)), "input": 0, "output": 0,
+                 "cache_write": 0, "cache_read": 0} for i in range(7)]
+        models, session = {}, {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+        for ts, inp, out, cw, cr, model in scan_history(start):
+            t = parse_ts(ts)
+            if not t or not (start <= t < end):
+                continue
+            day = days[min(6, int((t - start).total_seconds() // 86400))]
+            for k, v in (("input", inp), ("output", out), ("cache_write", cw), ("cache_read", cr)):
+                day[k] += v
+                if s_start and s_start <= t < s_end:
+                    session[k] += v
+            models[model] = models.get(model, 0) + inp + out + cw + cr
+        self.history = {
+            "window": {"start": iso(start), "end": iso(end)},
+            "days": days,
+            "session": session if s_start else None,
+            "models": sorted(({"model": m, "total": n} for m, n in models.items()),
+                             key=lambda x: -x["total"]),
+            "updated": iso(now()),
+        }
+
+    def write(self):
+        breakdown = (self.usage or {}).get("seven_day_breakdown") or {}
+        state = {
+            "updated": iso(self.usage_at),
+            "checked": iso(self.checked_at),
+            "stale": self.stale,
+            "error": self.error,
+            "plan": plan_name(),
+            "limits": self.limits(),
+            "breakdown": [{"name": r.get("display_name"), "percent": r.get("percent") or 0}
+                          for r in breakdown.get("rows") or []],
+            "history": self.history,
+            "raw": self.usage,
+        }
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(tmp, STATE)
+
+
+# ---------------------------------------------------------------- icon
+
+def scheme_colours():
+    try:
+        with open(SCHEME) as f:
+            c = json.load(f)["colours"]
+        return {k: c[k] for k in ("primary", "error", "outline", "outlineVariant")}
+    except (OSError, KeyError, ValueError):
+        return {"primary": "cba6f7", "error": "f38ba8", "outline": "7f849c", "outlineVariant": "45475a"}
+
+
+def _rgb(hexstr, alpha=1.0):
+    h = hexstr.lstrip("#")
+    return int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255, alpha
+
+
+def render_icon(size, five_hour, weekly, stale):
+    """Returns ARGB32 bytes in network byte order, as StatusNotifierItem wants."""
+    pal = scheme_colours()
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surf)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    c = size / 2
+
+    def ring(radius, width, lim):
+        cr.set_line_width(width)
+        cr.set_source_rgba(*_rgb(pal["outlineVariant"]))
+        cr.arc(c, c, radius, 0, 2 * math.pi)
+        cr.stroke()
+        if not lim:
+            return
+        frac = max(0.0, min(1.0, lim["percent"] / 100))
+        colour = (pal["outline"] if stale else
+                  {"warning": WARN_COLOUR, "critical": pal["error"]}.get(lim["severity"], pal["primary"]))
+        cr.set_source_rgba(*_rgb(colour))
+        if frac >= 0.995:
+            cr.arc(c, c, radius, 0, 2 * math.pi)
+        elif frac > 0:
+            cr.arc(c, c, radius, -math.pi / 2, -math.pi / 2 + frac * 2 * math.pi)
+        else:
+            return
+        cr.stroke()
+
+    ring(size * 0.40, size * 0.13, five_hour)
+    ring(size * 0.20, size * 0.12, weekly)
+    surf.flush()
+
+    data = bytearray(surf.get_data())
+    stride = surf.get_stride()
+    out = bytearray(size * size * 4)
+    for y in range(size):
+        for x in range(size):
+            i = y * stride + x * 4
+            b, g, r, a = data[i:i + 4]  # cairo: native-endian premultiplied
+            if a:
+                r, g, b = (min(255, v * 255 // a) for v in (r, g, b))
+            o = (y * size + x) * 4
+            out[o:o + 4] = bytes((a, r, g, b))
+    return bytes(out)
+
+
+# ---------------------------------------------------------------- D-Bus objects
+
+class PropsMixin:
+    """Minimal org.freedesktop.DBus.Properties for python-dbus objects."""
+
+    def _props(self, iface):
+        raise NotImplementedError
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, iface, name):
+        return self._props(iface)[name]
+
+    @dbus.service.method(PROPS_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return dbus.Dictionary(self._props(iface), signature="sv")
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ssv")
+    def Set(self, iface, name, value):
+        pass
+
+    @dbus.service.signal(PROPS_IFACE, signature="sa{sv}as")
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+
+class Menu(PropsMixin, dbus.service.Object):
+    def __init__(self, bus, app):
+        super().__init__(bus, "/MenuBar")
+        self.app = app
+        self.revision = 1
+        self.items = {}  # id -> props
+
+    def rebuild(self, entries):
+        """entries: list of dicts with label/enabled/action, or None for a separator."""
+        self.items, self.actions = {}, {}
+        for i, e in enumerate(entries, start=1):
+            if e is None:
+                self.items[i] = {"type": "separator"}
+            else:
+                self.items[i] = {"label": e["label"], "enabled": e.get("enabled", True)}
+                if e.get("action"):
+                    self.actions[i] = e["action"]
+        self.revision += 1
+        self.LayoutUpdated(self.revision, 0)
+
+    def _props(self, iface):
+        return {"Version": dbus.UInt32(3), "TextDirection": "ltr", "Status": "normal",
+                "IconThemePath": dbus.Array([], signature="s")}
+
+    def _item_props(self, i):
+        return dbus.Dictionary(self.items[i], signature="sv")
+
+    def _node(self, i):
+        if i == 0:
+            props = dbus.Dictionary({"children-display": "submenu"}, signature="sv")
+            children = [self._node(k) for k in self.items]
+        else:
+            props, children = self._item_props(i), []
+        return dbus.Struct((dbus.Int32(i), props, dbus.Array(children, signature="v")),
+                           signature="ia{sv}av")
+
+    @dbus.service.method(MENU_IFACE, in_signature="iias", out_signature="u(ia{sv}av)")
+    def GetLayout(self, parent_id, depth, names):
+        return dbus.UInt32(self.revision), self._node(parent_id if parent_id in self.items else 0)
+
+    @dbus.service.method(MENU_IFACE, in_signature="aias", out_signature="a(ia{sv})")
+    def GetGroupProperties(self, ids, names):
+        return dbus.Array([dbus.Struct((dbus.Int32(i), self._item_props(i)), signature="ia{sv}")
+                           for i in (ids or self.items) if i in self.items], signature="(ia{sv})")
+
+    @dbus.service.method(MENU_IFACE, in_signature="is", out_signature="v")
+    def GetProperty(self, i, name):
+        return self.items[i][name]
+
+    @dbus.service.method(MENU_IFACE, in_signature="isvu")
+    def Event(self, i, event, data, timestamp):
+        if event == "clicked" and i in self.actions:
+            GLib.idle_add(self.actions[i])
+
+    @dbus.service.method(MENU_IFACE, in_signature="a(isvu)", out_signature="ai")
+    def EventGroup(self, events):
+        for i, event, data, ts in events:
+            self.Event(i, event, data, ts)
+        return dbus.Array([], signature="i")
+
+    @dbus.service.method(MENU_IFACE, in_signature="i", out_signature="b")
+    def AboutToShow(self, i):
+        self.app.maybe_refresh()  # hovering the icon opens the menu
+        return False
+
+    @dbus.service.method(MENU_IFACE, in_signature="ai", out_signature="aiai")
+    def AboutToShowGroup(self, ids):
+        self.app.maybe_refresh()
+        return dbus.Array([], signature="i"), dbus.Array([], signature="i")
+
+    @dbus.service.signal(MENU_IFACE, signature="ui")
+    def LayoutUpdated(self, revision, parent):
+        pass
+
+    @dbus.service.signal(MENU_IFACE, signature="a(ia{sv})a(ias)")
+    def ItemsPropertiesUpdated(self, updated, removed):
+        pass
+
+
+class Item(PropsMixin, dbus.service.Object):
+    def __init__(self, bus, app):
+        super().__init__(bus, "/StatusNotifierItem")
+        self.app = app
+        self.pixmaps = dbus.Array([], signature="(iiay)")
+        self.tooltip = "Claude usage"
+
+    def set_icon(self, five_hour, weekly, stale):
+        self.pixmaps = dbus.Array(
+            [dbus.Struct((dbus.Int32(s), dbus.Int32(s), dbus.ByteArray(render_icon(s, five_hour, weekly, stale))),
+                         signature="iiay") for s in (32, 64)], signature="(iiay)")
+        self.NewIcon()
+
+    def set_tooltip(self, text):
+        self.tooltip = text
+        self.NewToolTip()
+
+    def _props(self, iface):
+        empty = dbus.Array([], signature="(iiay)")
+        return {
+            "Category": "ApplicationStatus", "Id": "claude-usage", "Title": "Claude usage",
+            "Status": "Active", "WindowId": dbus.Int32(0), "IconThemePath": "",
+            "IconName": "", "IconPixmap": self.pixmaps,
+            "OverlayIconName": "", "OverlayIconPixmap": empty,
+            "AttentionIconName": "", "AttentionIconPixmap": empty, "AttentionMovieName": "",
+            "ToolTip": dbus.Struct(("", empty, "Claude usage", self.tooltip), signature="sa(iiay)ss"),
+            "ItemIsMenu": False, "Menu": dbus.ObjectPath("/MenuBar"),
+        }
+
+    @dbus.service.method(SNI_IFACE, in_signature="ii")
+    def Activate(self, x, y):
+        GLib.idle_add(self.app.toggle_panel)
+
+    @dbus.service.method(SNI_IFACE, in_signature="ii")
+    def SecondaryActivate(self, x, y):
+        GLib.idle_add(self.app.refresh, True)
+
+    @dbus.service.method(SNI_IFACE, in_signature="ii")
+    def ContextMenu(self, x, y):
+        pass
+
+    @dbus.service.method(SNI_IFACE, in_signature="is")
+    def Scroll(self, delta, orientation):
+        pass
+
+    @dbus.service.signal(SNI_IFACE)
+    def NewIcon(self):
+        pass
+
+    @dbus.service.signal(SNI_IFACE)
+    def NewToolTip(self):
+        pass
+
+    @dbus.service.signal(SNI_IFACE, signature="s")
+    def NewStatus(self, status):
+        pass
+
+
+# ---------------------------------------------------------------- app
+
+def fmt_reset(s):
+    t = parse_ts(s)
+    if not t:
+        return ""
+    t = t.astimezone()
+    today = datetime.now().astimezone().date()
+    if t.date() == today:
+        return t.strftime("%H:%M")
+    return t.strftime("%a %H:%M")
+
+
+def fmt_tokens(n):
+    for div, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= div:
+            return f"{n / div:.1f}{suffix}"
+    return str(n)
+
+
+class App:
+    def __init__(self):
+        DBusGMainLoop(set_as_default=True)
+        self.bus = dbus.SessionBus()
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.bus_name = dbus.service.BusName(self.name, self.bus)
+        self.state = State()
+        self.menu = Menu(self.bus, self)
+        self.item = Item(self.bus, self)
+        self.busy = False
+        self.last_api = 0.0
+        self.bus.add_signal_receiver(self._watcher_changed, "NameOwnerChanged",
+                                     "org.freedesktop.DBus", arg0=WATCHER)
+        self.update_ui()
+        self.register()
+
+    # Re-register whenever the tray host (Caelestia) restarts.
+    def _watcher_changed(self, name, old, new):
+        if new:
+            GLib.timeout_add(500, self.register)
+
+    def register(self):
+        try:
+            self.bus.get_object(WATCHER, "/StatusNotifierWatcher").RegisterStatusNotifierItem(
+                self.name, dbus_interface=WATCHER)
+        except dbus.DBusException:
+            pass  # no watcher yet; NameOwnerChanged will call us again
+        return False
+
+    def maybe_refresh(self):
+        c = self.state.checked_at
+        if not c or (now() - c).total_seconds() > HOVER_REFRESH:
+            GLib.idle_add(self.refresh, True)
+
+    def refresh(self, force_api=False):
+        if self.busy:
+            return False
+        self.busy = True
+        do_api = force_api or time.monotonic() - self.last_api >= API_EVERY
+        threading.Thread(target=self._work, args=(do_api,), daemon=True).start()
+        return False  # one-shot when scheduled with idle_add
+
+    def tick(self):
+        self.refresh()
+        return True  # keep the periodic timer alive
+
+    def _work(self, do_api):
+        st = self.state
+        try:
+            if do_api:
+                payload, err = fetch_usage()
+                self.last_api = time.monotonic()
+                with st.lock:
+                    st.checked_at, st.error = now(), err
+                    if payload:
+                        st.usage, st.usage_at = payload, now()
+            with st.lock:
+                st.compute_history()
+                st.write()
+        finally:
+            GLib.idle_add(self._done)
+
+    def _done(self):
+        self.busy = False
+        self.update_ui()
+        return False
+
+    def update_ui(self):
+        st = self.state
+        limits = st.limits()
+        by_label = {l["label"]: l for l in limits}
+        self.item.set_icon(by_label.get("5-hour"), by_label.get("Weekly"), st.stale)
+
+        entries = []
+        for l in limits:
+            entries.append({"label": f"{l['label']}  {l['percent']:.0f}%  ·  {fmt_reset(l['resets_at'])}",
+                            "action": self.toggle_panel})
+        if not limits:
+            entries.append({"label": "No usage data yet", "enabled": False})
+        sess = (st.history or {}).get("session")
+        if sess:
+            entries.append({"label": f"This session  {fmt_tokens(sum(sess.values()))} tokens",
+                            "action": self.toggle_panel})
+        entries.append(None)
+        when = st.usage_at.astimezone().strftime("%H:%M") if st.usage_at else "never"
+        if st.error:
+            entries.append({"label": f"Stale (as of {when}): {st.error}", "enabled": False})
+        else:
+            entries.append({"label": f"Updated {when}", "enabled": False})
+        entries.append({"label": "Details", "action": self.toggle_panel})
+        entries.append({"label": "Refresh now", "action": lambda: self.refresh(True) or False})
+        self.menu.rebuild(entries)
+
+        tip = "\n".join(f"{l['label']}: {l['percent']:.0f}%" for l in limits) or "No usage data yet"
+        self.item.set_tooltip(tip)
+
+    def toggle_panel(self):
+        # Place the panel on the monitor under the cursor, level with it.
+        args = []
+        try:
+            cur = json.loads(subprocess.run(["hyprctl", "cursorpos", "-j"], capture_output=True,
+                                            text=True, timeout=2).stdout)
+            mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True,
+                                             text=True, timeout=2).stdout)
+            for m in mons:
+                w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+                if m["transform"] % 2:
+                    w, h = h, w
+                if m["x"] <= cur["x"] < m["x"] + w and m["y"] <= cur["y"] < m["y"] + h:
+                    args = [m["name"], str(int(cur["y"] - m["y"]))]
+                    break
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            pass
+        ipc = ["qs", "-c", "claude-usage", "ipc", "call", "panel", "toggle"] + (args or ["", "-1"])
+        if subprocess.run(ipc, capture_output=True, timeout=5).returncode != 0:
+            # Panel not running yet: start it, then retry once it has loaded.
+            subprocess.Popen(["qs", "-c", "claude-usage", "-d"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            GLib.timeout_add(1500, lambda: subprocess.run(ipc, capture_output=True, timeout=5) and False)
+        self.refresh(False)
+        return False
+
+    def run(self):
+        self.refresh(True)
+        GLib.timeout_add_seconds(HISTORY_EVERY, self.tick)
+        GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    App().run()
