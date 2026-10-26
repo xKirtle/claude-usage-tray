@@ -4,6 +4,7 @@
 - Tray icon (StatusNotifierItem): outer ring = 5-hour limit, inner ring = weekly limit.
 - Hover menu (DBusMenu): every limit with its reset time, plus refresh / details.
 - Left click: toggles the Quickshell details panel (~/.config/quickshell/claude-usage).
+  --panel-scale F starts the panel F times larger (QT_SCALE_FACTOR; default 1).
 
 Limits come from the endpoint Claude Code's /usage uses, authenticated with the token
 Claude Code already stores. The token is never refreshed here (that would rotate it under
@@ -11,6 +12,7 @@ Claude Code); while it's expired the last good result is shown as stale.
 Token history comes from local Claude Code transcripts (~/.claude/projects/**/*.jsonl).
 Everything the panel needs is written to ~/.cache/claude-usage/state.json.
 """
+import argparse
 import glob
 import json
 import math
@@ -513,7 +515,8 @@ def fmt_tokens(n):
 
 
 class App:
-    def __init__(self):
+    def __init__(self, panel_scale=1.0):
+        self.panel_scale = panel_scale
         DBusGMainLoop(set_as_default=True)
         self.bus = dbus.SessionBus()
         self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
@@ -628,7 +631,10 @@ class App:
         ipc = ["qs", "-c", "claude-usage", "ipc", "call", "panel", "toggle"] + (args or ["", "-1"])
         if subprocess.run(ipc, capture_output=True, timeout=5).returncode != 0:
             # Panel not running yet: start it, then retry once it has loaded.
-            subprocess.Popen(["qs", "-c", "claude-usage", "-d"], stdout=subprocess.DEVNULL,
+            env = dict(os.environ)
+            if self.panel_scale != 1:
+                env["QT_SCALE_FACTOR"] = str(self.panel_scale)
+            subprocess.Popen(["qs", "-c", "claude-usage", "-d"], env=env, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
             GLib.timeout_add(1500, lambda: subprocess.run(ipc, capture_output=True, timeout=5) and False)
         self.refresh(False)
@@ -641,4 +647,7 @@ class App:
 
 
 if __name__ == "__main__":
-    App().run()
+    parser = argparse.ArgumentParser(description="Claude usage tray icon for the Caelestia bar.")
+    parser.add_argument("--panel-scale", type=float, default=1.0, metavar="F",
+                        help="draw the details panel F times larger (QT_SCALE_FACTOR), e.g. 1.25")
+    App(parser.parse_args().panel_scale).run()

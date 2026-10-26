@@ -73,6 +73,10 @@ Uninstall with `./install.sh --uninstall`.
 - The panel doesn't live-reload. After editing `panel/shell.qml`, run `qs -c claude-usage kill`
   and click the icon again.
 - Logs: `journalctl --user -u claude-usage-tray`, `qs -c claude-usage log`.
+- Bigger panel: `claude-usage-tray --panel-scale 1.25` starts it with `QT_SCALE_FACTOR=1.25` (text, padding
+  and size; the panel divides the cursor position by it). Set it without editing the unit:
+  `systemctl --user edit claude-usage-tray`, then
+  `[Service]` / `ExecStart=` / `ExecStart=%h/.local/bin/claude-usage-tray --panel-scale 1.25`.
 
 ## License
 

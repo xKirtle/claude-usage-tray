@@ -15,6 +15,7 @@ ShellRoot {
     property bool open: false
     property string monitor: ""
     property int cursorY: -1
+    readonly property real qtScale: Number(Quickshell.env("QT_SCALE_FACTOR")) || 1
     property var st: ({})
     property var pal: ({})
     property int hovered: -1
@@ -135,7 +136,8 @@ ShellRoot {
         margins.left: 10
         margins.top: {
             const h = implicitHeight, sh = screen ? screen.height : 1080;
-            const y = root.cursorY < 0 ? (sh - h) / 2 : root.cursorY - 60;
+            // cursorY is in compositor pixels; under QT_SCALE_FACTOR the panel's units are that much larger
+            const y = root.cursorY < 0 ? (sh - h) / 2 : root.cursorY / root.qtScale - 60;
             return Math.max(10, Math.min(sh - h - 10, y));
         }
 
